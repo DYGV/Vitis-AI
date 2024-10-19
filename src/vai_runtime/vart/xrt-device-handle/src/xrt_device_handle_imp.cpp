@@ -255,16 +255,12 @@ XrtDeviceHandleImp::XrtDeviceHandleImp() {
           do_detect_ddr_or_hbm(devices[deviceIndex].mName);
     }
 
-    auto mtx = vitis::ai::Lock::create("DPU_" + std::to_string(deviceIndex));
-    mtx_.push_back(std::move(mtx));
-    auto lock = std::make_unique<std::unique_lock<vitis::ai::Lock>>(
-        *(mtx_.back().get()), std::try_to_lock_t());
-    if (!lock->owns_lock()) {
-      LOG(INFO) << "waiting for process to release the resource:"
-                << " DPU_" + std::to_string(deviceIndex);
-      lock->lock();
-    }
-    locks_.push_back(std::move(lock));
+    // This version assumes that there is one device and
+    // multiple cores of DPUs available, with one process using DPU_{i}
+    // and another process using DPU_{i+1}.
+    // This is not possible in the original Vitis AI. If a process locks,
+    // it cannot get handles from other processes and waits,
+    // so it had to be multi-threaded when using multiple DPUs.
 
     auto handle = xclOpen((unsigned int)deviceIndex, NULL, XCL_INFO);
     if (!ENV_PARAM(XLNX_DISABLE_LOAD_XCLBIN)) {
@@ -280,12 +276,26 @@ XrtDeviceHandleImp::XrtDeviceHandleImp() {
     xclClose(handle);
     for (auto i = 0u; i < binstream_->get_num_of_cu(); ++i) {
       auto cu_full_name = binstream_->get_cu(i);
-      if (cu_full_name.find("DPU") == std::string::npos &&
-          cu_full_name.find("dpu") == std::string::npos &&
-          cu_full_name.find("sfm") == std::string::npos) {
+      // Assume no softmax cores are used.
+      if ((cu_full_name.find("DPU") == std::string::npos &&
+          cu_full_name.find("dpu") == std::string::npos) ||
+          cu_full_name.find("sfm") != std::string::npos) {
         continue;
       }
       auto kernel_name = my_get_kernel_name(cu_full_name);
+
+      // Create and lock a file in /tmp with the name of the CU.
+      // This prevents other processes from using the locked CU.
+      auto cu_mtx = vitis::ai::Lock::create(cu_full_name);
+      mtx_.push_back(std::move(cu_mtx));
+      auto cu_lock = std::make_unique<std::unique_lock<vitis::ai::Lock>>(
+         *(mtx_.back().get()), std::try_to_lock_t());
+      if (!cu_lock->owns_lock()) {
+          continue;
+      }
+      locks_.push_back(std::move(cu_lock));
+      LOG(INFO) << "found : " + cu_full_name;
+
       LOG_IF(INFO, ENV_PARAM(DEBUG_XRT_DEVICE_HANDLE))
           << "cu[" << i << "] = " << cu_full_name << " cu_name=" << kernel_name;
       auto& x = handles_[cu_full_name + ":" + std::to_string(deviceIndex)];
@@ -342,6 +352,9 @@ XrtDeviceHandleImp::XrtDeviceHandleImp() {
           << " fingerprint " << std::hex << "0x" <<                         //
           x.fingerprint << std::dec << " "                                  //
           ;
+      // The fact that the program has reached this point means that
+      // it has caught a usable DPU, so it breaks to exit.
+      break;
     }
   }
   // TODO : check handles_ is not null
